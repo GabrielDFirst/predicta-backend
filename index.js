@@ -1,12 +1,21 @@
-const twilio = require("twilio");
+/**
+ * Predicta Backend (Express)
+ * - Health check route: GET /
+ * - Meta webhook verification: GET /webhook
+ * - Incoming webhook receiver: POST /webhook
+ * - Twilio WhatsApp Sandbox test sender (TEMP): GET /test-whatsapp
+ */
 
 require("dotenv").config();
+
 const express = require("express");
 const bodyParser = require("body-parser");
+const twilio = require("twilio");
 
 const app = express();
 app.use(bodyParser.json());
 
+// Twilio client (requires TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
 const client = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
@@ -38,24 +47,39 @@ app.post("/webhook", (req, res) => {
   res.sendStatus(200);
 });
 
-// 🔹 TEMPORARY: Test WhatsApp message
+/**
+ * TEMPORARY: Test WhatsApp message via Twilio Sandbox
+ *
+ * IMPORTANT:
+ * 1) Your environment variable must be:
+ *    TWILIO_WHATSAPP_FROM = whatsapp:+14155238886
+ * 2) You must have joined the Twilio sandbox from your phone already (Step 1).
+ * 3) "to" must be in the format: whatsapp:+<E164 number>
+ */
 app.get("/test-whatsapp", async (req, res) => {
   try {
     const message = await client.messages.create({
-      from: process.env.TWILIO_WHATSAPP_FROM, // whatsapp:+14155238886
-      to: "whatsapp:+447425524117", // 👈 YOUR personal WhatsApp number
-      body: "✅ Predicta backend test via Twilio WhatsApp Sandbox"
+      from: process.env.TWILIO_WHATSAPP_FROM, // e.g. whatsapp:+14155238886
+      to: "whatsapp:+447425524117", // your personal WhatsApp number in E.164
+      body: "✅ Predicta backend test via Twilio WhatsApp Sandbox",
     });
 
-    res.json({
+    return res.status(200).json({
       success: true,
-      sid: message.sid
+      sid: message.sid,
+      status: message.status,
+      to: message.to,
+      from: message.from,
     });
   } catch (error) {
     console.error("Twilio error:", error);
-    res.status(500).json({
+
+    // Twilio errors often include a "code" and more details
+    return res.status(500).json({
       success: false,
-      error: error.message
+      message: error.message,
+      code: error.code,
+      moreInfo: error.moreInfo,
     });
   }
 });
@@ -64,4 +88,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
   console.log(`VERIFY_TOKEN loaded: ${process.env.VERIFY_TOKEN ? "YES" : "NO"}`);
+  console.log(`TWILIO_ACCOUNT_SID loaded: ${process.env.TWILIO_ACCOUNT_SID ? "YES" : "NO"}`);
+  console.log(`TWILIO_AUTH_TOKEN loaded: ${process.env.TWILIO_AUTH_TOKEN ? "YES" : "NO"}`);
+  console.log(`TWILIO_WHATSAPP_FROM loaded: ${process.env.TWILIO_WHATSAPP_FROM ? "YES" : "NO"}`);
 });
