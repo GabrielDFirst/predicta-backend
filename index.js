@@ -85,6 +85,42 @@ app.get("/test-whatsapp", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+// ✅ OUTBOUND: Send WhatsApp message dynamically
+app.post("/send-whatsapp", async (req, res) => {
+  try {
+    const { to, body } = req.body;
+
+    if (!to || !body) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields: to, body",
+      });
+    }
+
+    const toWhatsApp = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
+
+    const message = await client.messages.create({
+      from: process.env.TWILIO_WHATSAPP_FROM, // whatsapp:+14155238886 (sandbox)
+      to: toWhatsApp,
+      body,
+    });
+
+    return res.json({
+      success: true,
+      sid: message.sid,
+      status: message.status,
+    });
+  } catch (error) {
+    console.error("Twilio send error:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
   console.log(`VERIFY_TOKEN loaded: ${process.env.VERIFY_TOKEN ? "YES" : "NO"}`);
