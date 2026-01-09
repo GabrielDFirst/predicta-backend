@@ -1,9 +1,16 @@
+const twilio = require("twilio");
+
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
 
 const app = express();
 app.use(bodyParser.json());
+
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
 // Health check
 app.get("/", (req, res) => {
@@ -29,6 +36,28 @@ app.post("/webhook", (req, res) => {
   console.log("Incoming webhook payload:");
   console.log(JSON.stringify(req.body, null, 2));
   res.sendStatus(200);
+});
+
+// 🔹 TEMPORARY: Test WhatsApp message
+app.get("/test-whatsapp", async (req, res) => {
+  try {
+    const message = await client.messages.create({
+      from: process.env.TWILIO_WHATSAPP_FROM, // whatsapp:+14155238886
+      to: "whatsapp:+447425524117", // 👈 YOUR personal WhatsApp number
+      body: "✅ Predicta backend test via Twilio WhatsApp Sandbox"
+    });
+
+    res.json({
+      success: true,
+      sid: message.sid
+    });
+  } catch (error) {
+    console.error("Twilio error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
