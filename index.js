@@ -2,9 +2,10 @@
  * Predicta Backend (Express)
  * - Health check route: GET /
  * - Meta webhook verification: GET /webhook
- * - Incoming webhook receiver: POST /webhook
+ * - Incoming webhook receiver (Twilio-style logging + auto-reply): POST /webhook
  * - Twilio WhatsApp Sandbox test sender (TEMP): GET /test-whatsapp
  * - Outbound WhatsApp sender (protected): POST /send-whatsapp
+ * - Optional TwiML inbound auto-reply endpoint: POST /twilio/whatsapp
  *
  * Required env vars:
  * - TWILIO_ACCOUNT_SID
@@ -26,7 +27,6 @@ const twilio = require("twilio");
 const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
-
 
 // Twilio client (requires TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
 const client = twilio(
@@ -53,11 +53,36 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// Incoming webhook messages (POST)
-app.post("/webhook", (req, res) => {
-  console.log("Incoming webhook payload:");
-  console.log(JSON.stringify(req.body, null, 2));
-  res.sendStatus(200);
+// ✅ Incoming webhook messages (POST) + auto-reply (Twilio-style inbound payload)
+app.post("/webhook", async (req, res) => {
+  try {
+    console.log("Incoming webhook payload:");
+    console.log(JSON.stringify(req.body, null, 2));
+
+    // Twilio inbound fields (WhatsApp Sandbox)
+    const incomingMsg = req.body?.Body;
+    const from = req.body?.From; // e.g. "whatsapp:+447...."
+
+    // If this is not a Twilio message, just acknowledge
+    if (!incomingMsg || !from) {
+      return res.sendStatus(200);
+    }
+
+    console.log("Incoming message:", incomingMsg);
+    console.log("From:", from);
+
+    // Simple auto-reply (send back to the sender)
+    await client.messages.create({
+      from: process.env.TWILIO_WHATSAPP_FROM, // e.g. whatsapp:+14155238886
+      to: from,
+      body: `👋 Hello! Predicta received: "${incomingMsg}"`,
+    });
+
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error("Auto-reply error:", error);
+    return res.sendStatus(500);
+  }
 });
 
 /**
@@ -166,13 +191,13 @@ app.post("/send-whatsapp", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-// ✅ INBOUND: Twilio WhatsApp webhook (receives incoming messages and auto-replies)
+// ✅ INBOUND (Alternative): Twilio WhatsApp webhook (TwiML auto-reply)
 app.post("/twilio/whatsapp", (req, res) => {
   try {
-    const from = req.body.From;      // e.g. "whatsapp:+447..."
-    const incoming = req.body.Body;  // message text
+    const from = req.body.From; // e.g. "whatsapp:+447..."
+    const incoming = req.body.Body; // message text
 
-    console.log("Inbound WhatsApp:", { from, incoming });
+    console.log("Inbound WhatsApp (TwiML route):", { from, incoming });
 
     const twiml = new twilio.twiml.MessagingResponse();
     twiml.message(`Hello 👋 I am Predicta. You said: "${incoming}"`);
@@ -183,7 +208,6 @@ app.post("/twilio/whatsapp", (req, res) => {
     return res.sendStatus(200);
   }
 });
-
 
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
@@ -201,3 +225,4 @@ app.listen(PORT, () => {
     `PREDICTA_API_KEY loaded: ${process.env.PREDICTA_API_KEY ? "YES" : "NO"}`
   );
 });
+
