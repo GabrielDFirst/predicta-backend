@@ -25,6 +25,8 @@ const twilio = require("twilio");
 
 const app = express();
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
+
 
 // Twilio client (requires TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
 const client = twilio(
@@ -163,6 +165,25 @@ app.post("/send-whatsapp", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+// ✅ INBOUND: Twilio WhatsApp webhook (receives incoming messages and auto-replies)
+app.post("/twilio/whatsapp", (req, res) => {
+  try {
+    const from = req.body.From;      // e.g. "whatsapp:+447..."
+    const incoming = req.body.Body;  // message text
+
+    console.log("Inbound WhatsApp:", { from, incoming });
+
+    const twiml = new twilio.twiml.MessagingResponse();
+    twiml.message(`Hello 👋 I am Predicta. You said: "${incoming}"`);
+
+    return res.type("text/xml").send(twiml.toString());
+  } catch (err) {
+    console.error("Inbound webhook error:", err);
+    return res.sendStatus(200);
+  }
+});
+
 
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
