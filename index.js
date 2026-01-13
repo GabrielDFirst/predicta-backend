@@ -12,6 +12,7 @@
  * - TWILIO_AUTH_TOKEN
  * - TWILIO_WHATSAPP_FROM   (e.g. whatsapp:+14155238886 for Twilio Sandbox)
  * - PREDICTA_API_KEY       (your own secret for protecting /send-whatsapp)
+ * - DATABASE_URL           (Render Postgres External Database URL)
  *
  * Optional env vars:
  * - VERIFY_TOKEN           (only needed if you’re using Meta webhook verification)
@@ -23,10 +24,28 @@ require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
 const twilio = require("twilio");
+const { Pool } = require("pg"); // ✅ Step 2: Postgres
 
 const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
+
+// ==============================
+// ✅ Step 2: Postgres connection (Render)
+// ==============================
+// Use Render Postgres "External Database URL" in DATABASE_URL
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
+
+// Optional connectivity check (prints once at startup)
+pool
+  .query("SELECT 1")
+  .then(() => console.log("Postgres connected ✅"))
+  .catch((err) => console.error("Postgres connection error ❌", err));
 
 // Twilio client (requires TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
 const client = twilio(
@@ -40,7 +59,10 @@ const client = twilio(
 
 // Default currency per owner (you can expand this as you onboard people)
 const OWNER_PROFILES = {
-  "whatsapp:+447425524117": { businessName: "Gabriel Demo Business", defaultCurrency: "GBP" },
+  "whatsapp:+447425524117": {
+    businessName: "Gabriel Demo Business",
+    defaultCurrency: "GBP",
+  },
   // Add more owners like:
   // "whatsapp:+2348012345678": { businessName: "Mama T Foods", defaultCurrency: "NGN" },
 };
@@ -101,8 +123,6 @@ function helpText(businessName) {
   );
 }
 
-
-
 // Health check
 app.get("/", (req, res) => {
   res.status(200).send("Predicta backend running");
@@ -156,19 +176,12 @@ app.post("/webhook", async (req, res) => {
 
 /**
  * TEMPORARY: Test WhatsApp message via Twilio Sandbox
- *
- * IMPORTANT:
- * 1) TWILIO_WHATSAPP_FROM must be: whatsapp:+14155238886 (sandbox)
- * 2) You must have joined the Twilio sandbox from your phone already.
- * 3) "to" must be in format: whatsapp:+<E164 number>
- *
- * Tip: you can also read ?to=+447... from query if you want later.
  */
 app.get("/test-whatsapp", async (req, res) => {
   try {
     const message = await client.messages.create({
-      from: process.env.TWILIO_WHATSAPP_FROM, // e.g. whatsapp:+14155238886
-      to: "whatsapp:+447425524117", // your personal WhatsApp number in E.164
+      from: process.env.TWILIO_WHATSAPP_FROM,
+      to: "whatsapp:+447425524117",
       body: "✅ Predicta backend test via Twilio WhatsApp Sandbox",
     });
 
@@ -193,24 +206,8 @@ app.get("/test-whatsapp", async (req, res) => {
 
 /**
  * OUTBOUND: Send WhatsApp message dynamically (protected with x-api-key)
- *
- * Request:
- * POST /send-whatsapp
- * Headers:
- * - Content-Type: application/json
- * - x-api-key: <your PREDICTA_API_KEY>
- * Body:
- * {
- *   "to": "+4474...." OR "whatsapp:+4474....",
- *   "body": "hello"
- * }
- *
- * Notes:
- * - If "to" is missing and DEFAULT_WHATSAPP_TO exists, it will use the default.
- * - "to" is normalized to whatsapp:+E164
  */
 app.post("/send-whatsapp", async (req, res) => {
-  // API key protection
   const apiKey = req.header("x-api-key");
   if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
     return res.status(401).json({ success: false, error: "Unauthorized" });
@@ -219,7 +216,6 @@ app.post("/send-whatsapp", async (req, res) => {
   try {
     const { to, body } = req.body || {};
 
-    // Allow fallback to DEFAULT_WHATSAPP_TO if "to" not provided
     const finalTo = to || process.env.DEFAULT_WHATSAPP_TO;
 
     if (!finalTo || !body) {
@@ -229,13 +225,12 @@ app.post("/send-whatsapp", async (req, res) => {
       });
     }
 
-    // Normalize to WhatsApp format
     const toWhatsApp = finalTo.startsWith("whatsapp:")
       ? finalTo
       : `whatsapp:${finalTo}`;
 
     const message = await client.messages.create({
-      from: process.env.TWILIO_WHATSAPP_FROM, // whatsapp:+14155238886 (sandbox)
+      from: process.env.TWILIO_WHATSAPP_FROM,
       to: toWhatsApp,
       body,
     });
@@ -260,6 +255,7 @@ app.post("/send-whatsapp", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
+// ✅ INBOUND: TwiML auto-reply endpoint (Event Engine)
 app.post("/twilio/whatsapp", (req, res) => {
   try {
     const from = req.body.From; // "whatsapp:+..."
@@ -269,7 +265,6 @@ app.post("/twilio/whatsapp", (req, res) => {
 
     console.log("Inbound WhatsApp (Event Engine):", { from, incomingRaw });
 
-    // Basic normalization
     const incoming = incomingRaw.replace(/\s+/g, " ");
     const parts = incoming.split(" ");
     const cmd = (parts[0] || "").toLowerCase();
@@ -281,11 +276,10 @@ app.post("/twilio/whatsapp", (req, res) => {
     } else if (cmd === "help") {
       reply = helpText(businessName);
     } else if (cmd === "sale") {
-      // sale <item> <qty> <amount> [currency]
       const item = parts[1];
       const qtyStr = parts[2];
       const amountToken = parts[3];
-      const currencyToken = parts[4]; // optional
+      const currencyToken = parts[4];
 
       const qty = Number(qtyStr);
 
@@ -316,10 +310,9 @@ app.post("/twilio/whatsapp", (req, res) => {
         }
       }
     } else if (cmd === "expense") {
-      // expense <category> <amount> [currency]
       const category = parts[1];
       const amountToken = parts[2];
-      const currencyToken = parts[3]; // optional
+      const currencyToken = parts[3];
 
       if (!category || !amountToken) {
         reply = `Usage: expense <category> <amount>[currency]\nExample: expense fuel ₦15000`;
@@ -347,7 +340,6 @@ app.post("/twilio/whatsapp", (req, res) => {
         }
       }
     } else if (cmd === "stock") {
-      // stock <item> <qty>
       const item = parts[1];
       const qtyStr = parts[2];
       const qty = Number(qtyStr);
@@ -372,7 +364,6 @@ app.post("/twilio/whatsapp", (req, res) => {
           `Time: ${event.timestamp}`;
       }
     } else {
-      // Fallback
       reply =
         `I didn’t understand that.\n` +
         `Type "help" to see commands.\n\n` +
@@ -388,10 +379,10 @@ app.post("/twilio/whatsapp", (req, res) => {
   }
 });
 
-
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
   console.log(`VERIFY_TOKEN loaded: ${process.env.VERIFY_TOKEN ? "YES" : "NO"}`);
+  console.log(`DATABASE_URL loaded: ${process.env.DATABASE_URL ? "YES" : "NO"}`);
   console.log(
     `TWILIO_ACCOUNT_SID loaded: ${process.env.TWILIO_ACCOUNT_SID ? "YES" : "NO"}`
   );
