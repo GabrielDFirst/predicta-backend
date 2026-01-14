@@ -379,6 +379,65 @@ app.post("/twilio/whatsapp", (req, res) => {
   }
 });
 
+// ✅ One-time DB init endpoint (protect it with x-api-key)
+app.post("/admin/init-db", async (req, res) => {
+  const apiKey = req.header("x-api-key");
+  if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS businesses (
+        id SERIAL PRIMARY KEY,
+        business_name TEXT NOT NULL,
+        whatsapp_from TEXT UNIQUE NOT NULL,
+        default_currency TEXT DEFAULT 'NGN',
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sales (
+        id SERIAL PRIMARY KEY,
+        business_id INT REFERENCES businesses(id) ON DELETE CASCADE,
+        item TEXT NOT NULL,
+        quantity INT NOT NULL,
+        amount NUMERIC NOT NULL,
+        currency TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS expenses (
+        id SERIAL PRIMARY KEY,
+        business_id INT REFERENCES businesses(id) ON DELETE CASCADE,
+        category TEXT NOT NULL,
+        amount NUMERIC NOT NULL,
+        currency TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS stock_events (
+        id SERIAL PRIMARY KEY,
+        business_id INT REFERENCES businesses(id) ON DELETE CASCADE,
+        item TEXT NOT NULL,
+        quantity INT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    return res.json({ success: true, message: "DB tables created/verified ✅" });
+  } catch (err) {
+    console.error("init-db error:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
   console.log(`VERIFY_TOKEN loaded: ${process.env.VERIFY_TOKEN ? "YES" : "NO"}`);
