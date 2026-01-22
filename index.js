@@ -446,6 +446,54 @@ app.post("/admin/init-db", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+// ✅ Admin: quick DB proof (latest records)
+app.get("/admin/latest", async (req, res) => {
+  const apiKey = req.header("x-api-key");
+  if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+
+  try {
+    const businesses = await pool.query(
+      "SELECT id, business_name, whatsapp_from, default_currency, created_at FROM businesses ORDER BY id DESC LIMIT 5"
+    );
+
+    const sales = await pool.query(
+      `SELECT s.id, s.business_id, s.item, s.quantity, s.amount, s.currency, s.created_at
+       FROM sales s
+       ORDER BY s.id DESC
+       LIMIT 10`
+    );
+
+    const expenses = await pool.query(
+      `SELECT e.id, e.business_id, e.category, e.amount, e.currency, e.created_at
+       FROM expenses e
+       ORDER BY e.id DESC
+       LIMIT 10`
+    );
+
+    const stock = await pool.query(
+      `SELECT se.id, se.business_id, se.item, se.quantity, se.created_at
+       FROM stock_events se
+       ORDER BY se.id DESC
+       LIMIT 10`
+    );
+
+    return res.json({
+      success: true,
+      businesses: businesses.rows,
+      sales: sales.rows,
+      expenses: expenses.rows,
+      stock_events: stock.rows,
+    });
+  } catch (err) {
+    console.error("admin/latest error:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
   console.log(`VERIFY_TOKEN loaded: ${process.env.VERIFY_TOKEN ? "YES" : "NO"}`);
