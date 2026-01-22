@@ -24,65 +24,50 @@ require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
 const twilio = require("twilio");
-const { Pool } = require("pg"); // ✅ Step 2: Postgres
+const { Pool } = require("pg"); // ✅ Postgres
 
 const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
 // ==============================
-// ✅ Step 2: Postgres connection (Render)
+// ✅ Postgres connection (Render)
 // ==============================
-// Use Render Postgres "External Database URL" in DATABASE_URL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  ssl: { rejectUnauthorized: false },
 });
 
-// Optional connectivity check (prints once at startup)
 pool
   .query("SELECT 1")
   .then(() => console.log("Postgres connected ✅"))
   .catch((err) => console.error("Postgres connection error ❌", err));
 
-// Twilio client (requires TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
-const client = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+// Twilio client
+const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 // ==============================
-// Predicta MVP: Event Engine (in-memory)
+// Predicta MVP: Event Engine
 // ==============================
-
-// Default currency per owner (you can expand this as you onboard people)
 const OWNER_PROFILES = {
-  "whatsapp:+447425524117": {
-    businessName: "Gabriel Demo Business",
-    defaultCurrency: "GBP",
-  },
-  // Add more owners like:
+  "whatsapp:+447425524117": { businessName: "Gabriel Demo Business", defaultCurrency: "GBP" },
+  // Add more owners later:
   // "whatsapp:+2348012345678": { businessName: "Mama T Foods", defaultCurrency: "NGN" },
 };
 
-// In-memory event store (will reset if Render restarts)
-const EVENTS = [];
+const EVENTS = []; // in-memory (debug only)
 
 // Currency helpers
 const SYMBOL_TO_CODE = { "£": "GBP", "$": "USD", "₦": "NGN" };
 const CODE_SET = new Set(["GBP", "USD", "NGN"]);
 
 function normalizeAmountToken(token) {
-  // Removes commas (e.g., 45,000 -> 45000)
   return String(token).replace(/,/g, "").trim();
 }
 
 function parseAmountAndCurrency(rawAmountToken, maybeCurrencyToken, defaultCurrency) {
   const amtToken = normalizeAmountToken(rawAmountToken);
 
-  // Case A: amount token includes a currency symbol e.g. "£45", "$120", "₦45000"
   const firstChar = amtToken.charAt(0);
   if (SYMBOL_TO_CODE[firstChar]) {
     const currency = SYMBOL_TO_CODE[firstChar];
@@ -92,7 +77,6 @@ function parseAmountAndCurrency(rawAmountToken, maybeCurrencyToken, defaultCurre
     return { amount, currency };
   }
 
-  // Case B: currency is supplied as a separate token e.g. "45 GBP"
   const maybeCode = (maybeCurrencyToken || "").toUpperCase().trim();
   if (maybeCode && CODE_SET.has(maybeCode)) {
     const amount = Number(amtToken);
@@ -100,7 +84,6 @@ function parseAmountAndCurrency(rawAmountToken, maybeCurrencyToken, defaultCurre
     return { amount, currency: maybeCode };
   }
 
-  // Case C: amount only -> default currency
   const amount = Number(amtToken);
   if (!Number.isFinite(amount)) return { error: "Invalid amount format." };
   return { amount, currency: defaultCurrency || "NGN" };
@@ -123,12 +106,57 @@ function helpText(businessName) {
   );
 }
 
-// Health check
-app.get("/", (req, res) => {
-  res.status(200).send("Predicta backend running");
-});
+// ==============================
+// ✅ DB Helpers
+// ==============================
+async function getOrCreateBusinessId(whatsappFrom, businessName, defaultCurrency) {
+  const existing = await pool.query(
+    "SELECT id FROM businesses WHERE whatsapp_from = $1 LIMIT 1",
+    [whatsappFrom]
+  );
+  if (existing.rows.length) return existing.rows[0].id;
 
-// Meta webhook verification (GET)
+  const created = await pool.query(
+    `INSERT INTO businesses (business_name, whatsapp_from, default_currency)
+     VALUES ($1, $2, $3)
+     RETURNING id`,
+    [businessName, whatsappFrom, defaultCurrency || "NGN"]
+  );
+  return created.rows[0].id;
+}
+
+async function insertSale(businessId, item, quantity, amount, currency) {
+  await pool.query(
+    `INSERT INTO sales (business_id, item, quantity, amount, currency)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [businessId, item, quantity, amount, currency]
+  );
+}
+
+async function insertExpense(businessId, category, amount, currency) {
+  await pool.query(
+    `INSERT INTO expenses (business_id, category, amount, currency)
+     VALUES ($1, $2, $3, $4)`,
+    [businessId, category, amount, currency]
+  );
+}
+
+async function insertStockEvent(businessId, item, quantity) {
+  await pool.query(
+    `INSERT INTO stock_events (business_id, item, quantity)
+     VALUES ($1, $2, $3)`,
+    [businessId, item, quantity]
+  );
+}
+
+// ==============================
+// Routes
+// ==============================
+
+// Health
+app.get("/", (req, res) => res.status(200).send("Predicta backend running"));
+
+// Meta verification (optional)
 app.get("/webhook", (req, res) => {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
@@ -136,33 +164,23 @@ app.get("/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// ✅ Incoming webhook messages (POST) + auto-reply (Twilio-style inbound payload)
+// Basic inbound (optional legacy route)
 app.post("/webhook", async (req, res) => {
   try {
     console.log("Incoming webhook payload:");
     console.log(JSON.stringify(req.body, null, 2));
 
-    // Twilio inbound fields (WhatsApp Sandbox)
     const incomingMsg = req.body?.Body;
-    const from = req.body?.From; // e.g. "whatsapp:+447...."
+    const from = req.body?.From;
 
-    // If this is not a Twilio message, just acknowledge
-    if (!incomingMsg || !from) {
-      return res.sendStatus(200);
-    }
+    if (!incomingMsg || !from) return res.sendStatus(200);
 
-    console.log("Incoming message:", incomingMsg);
-    console.log("From:", from);
-
-    // Simple auto-reply (send back to the sender)
     await client.messages.create({
-      from: process.env.TWILIO_WHATSAPP_FROM, // e.g. whatsapp:+14155238886
+      from: process.env.TWILIO_WHATSAPP_FROM,
       to: from,
       body: `👋 Hello! Predicta received: "${incomingMsg}"`,
     });
@@ -174,9 +192,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-/**
- * TEMPORARY: Test WhatsApp message via Twilio Sandbox
- */
+// Test sender
 app.get("/test-whatsapp", async (req, res) => {
   try {
     const message = await client.messages.create({
@@ -194,19 +210,11 @@ app.get("/test-whatsapp", async (req, res) => {
     });
   } catch (error) {
     console.error("Twilio error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: error.message,
-      code: error.code,
-      moreInfo: error.moreInfo,
-    });
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 
-/**
- * OUTBOUND: Send WhatsApp message dynamically (protected with x-api-key)
- */
+// Outbound protected
 app.post("/send-whatsapp", async (req, res) => {
   const apiKey = req.header("x-api-key");
   if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
@@ -215,7 +223,6 @@ app.post("/send-whatsapp", async (req, res) => {
 
   try {
     const { to, body } = req.body || {};
-
     const finalTo = to || process.env.DEFAULT_WHATSAPP_TO;
 
     if (!finalTo || !body) {
@@ -225,9 +232,7 @@ app.post("/send-whatsapp", async (req, res) => {
       });
     }
 
-    const toWhatsApp = finalTo.startsWith("whatsapp:")
-      ? finalTo
-      : `whatsapp:${finalTo}`;
+    const toWhatsApp = finalTo.startsWith("whatsapp:") ? finalTo : `whatsapp:${finalTo}`;
 
     const message = await client.messages.create({
       from: process.env.TWILIO_WHATSAPP_FROM,
@@ -235,35 +240,23 @@ app.post("/send-whatsapp", async (req, res) => {
       body,
     });
 
-    return res.json({
-      success: true,
-      sid: message.sid,
-      status: message.status,
-      to: message.to,
-      from: message.from,
-    });
+    return res.json({ success: true, sid: message.sid, status: message.status });
   } catch (error) {
     console.error("Twilio send error:", error);
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-      code: error.code,
-      moreInfo: error.moreInfo,
-    });
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-
-// ✅ INBOUND: TwiML auto-reply endpoint (Event Engine)
-app.post("/twilio/whatsapp", (req, res) => {
+// ✅ INBOUND: Twilio WhatsApp webhook (Event Engine + DB persistence)
+app.post("/twilio/whatsapp", async (req, res) => {
   try {
     const from = req.body.From; // "whatsapp:+..."
     const incomingRaw = (req.body.Body || "").trim();
 
     const { businessName, defaultCurrency } = getOwnerProfile(from);
+    const businessId = await getOrCreateBusinessId(from, businessName, defaultCurrency);
 
-    console.log("Inbound WhatsApp (Event Engine):", { from, incomingRaw });
+    console.log("Inbound WhatsApp:", { from, incomingRaw, businessId });
 
     const incoming = incomingRaw.replace(/\s+/g, " ");
     const parts = incoming.split(" ");
@@ -275,12 +268,12 @@ app.post("/twilio/whatsapp", (req, res) => {
       reply = "Predicta: I received an empty message. Type 'help' for commands.";
     } else if (cmd === "help") {
       reply = helpText(businessName);
+
     } else if (cmd === "sale") {
       const item = parts[1];
       const qtyStr = parts[2];
       const amountToken = parts[3];
       const currencyToken = parts[4];
-
       const qty = Number(qtyStr);
 
       if (!item || !Number.isFinite(qty) || qty <= 0 || !amountToken) {
@@ -294,6 +287,7 @@ app.post("/twilio/whatsapp", (req, res) => {
             type: "sale",
             owner: from,
             businessName,
+            businessId,
             item: item.toLowerCase(),
             quantity: qty,
             amount: parsed.amount,
@@ -303,12 +297,16 @@ app.post("/twilio/whatsapp", (req, res) => {
           };
           EVENTS.push(event);
 
+          // ✅ 5B.4: Persist sale
+          await insertSale(businessId, event.item, event.quantity, event.amount, event.currency);
+
           reply =
             `Sale recorded ✅\n` +
             `Item: ${event.item}\nQty: ${event.quantity}\nTotal: ${event.currency} ${event.amount}\n` +
             `Time: ${event.timestamp}`;
         }
       }
+
     } else if (cmd === "expense") {
       const category = parts[1];
       const amountToken = parts[2];
@@ -325,6 +323,7 @@ app.post("/twilio/whatsapp", (req, res) => {
             type: "expense",
             owner: from,
             businessName,
+            businessId,
             category: category.toLowerCase(),
             amount: parsed.amount,
             currency: parsed.currency,
@@ -333,12 +332,16 @@ app.post("/twilio/whatsapp", (req, res) => {
           };
           EVENTS.push(event);
 
+          // ✅ 5B.4: Persist expense
+          await insertExpense(businessId, event.category, event.amount, event.currency);
+
           reply =
             `Expense recorded ✅\n` +
             `Category: ${event.category}\nAmount: ${event.currency} ${event.amount}\n` +
             `Time: ${event.timestamp}`;
         }
       }
+
     } else if (cmd === "stock") {
       const item = parts[1];
       const qtyStr = parts[2];
@@ -351,6 +354,7 @@ app.post("/twilio/whatsapp", (req, res) => {
           type: "stock",
           owner: from,
           businessName,
+          businessId,
           item: item.toLowerCase(),
           quantity: qty,
           timestamp: new Date().toISOString(),
@@ -358,11 +362,15 @@ app.post("/twilio/whatsapp", (req, res) => {
         };
         EVENTS.push(event);
 
+        // ✅ 5B.4: Persist stock event
+        await insertStockEvent(businessId, event.item, event.quantity);
+
         reply =
           `Stock updated ✅\n` +
           `Item: ${event.item}\nQty: ${event.quantity}\n` +
           `Time: ${event.timestamp}`;
       }
+
     } else {
       reply =
         `I didn’t understand that.\n` +
@@ -379,7 +387,7 @@ app.post("/twilio/whatsapp", (req, res) => {
   }
 });
 
-// ✅ One-time DB init endpoint (protect it with x-api-key)
+// DB init endpoint (protected)
 app.post("/admin/init-db", async (req, res) => {
   const apiKey = req.header("x-api-key");
   if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
@@ -437,22 +445,14 @@ app.post("/admin/init-db", async (req, res) => {
   }
 });
 
-
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
   console.log(`VERIFY_TOKEN loaded: ${process.env.VERIFY_TOKEN ? "YES" : "NO"}`);
   console.log(`DATABASE_URL loaded: ${process.env.DATABASE_URL ? "YES" : "NO"}`);
-  console.log(
-    `TWILIO_ACCOUNT_SID loaded: ${process.env.TWILIO_ACCOUNT_SID ? "YES" : "NO"}`
-  );
-  console.log(
-    `TWILIO_AUTH_TOKEN loaded: ${process.env.TWILIO_AUTH_TOKEN ? "YES" : "NO"}`
-  );
-  console.log(
-    `TWILIO_WHATSAPP_FROM loaded: ${process.env.TWILIO_WHATSAPP_FROM ? "YES" : "NO"}`
-  );
-  console.log(
-    `PREDICTA_API_KEY loaded: ${process.env.PREDICTA_API_KEY ? "YES" : "NO"}`
-  );
+  console.log(`TWILIO_ACCOUNT_SID loaded: ${process.env.TWILIO_ACCOUNT_SID ? "YES" : "NO"}`);
+  console.log(`TWILIO_AUTH_TOKEN loaded: ${process.env.TWILIO_AUTH_TOKEN ? "YES" : "NO"}`);
+  console.log(`TWILIO_WHATSAPP_FROM loaded: ${process.env.TWILIO_WHATSAPP_FROM ? "YES" : "NO"}`);
+  console.log(`PREDICTA_API_KEY loaded: ${process.env.PREDICTA_API_KEY ? "YES" : "NO"}`);
 });
 
