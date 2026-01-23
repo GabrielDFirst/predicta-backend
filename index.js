@@ -494,6 +494,186 @@ app.get("/admin/latest", async (req, res) => {
 });
 
 
+// ✅ Admin: analytics summary (by business_id + period)
+app.get("/admin/summary", async (req, res) => {
+  const apiKey = req.header("x-api-key");
+  if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+
+  try {
+    // Inputs
+    const period = String(req.query.period || "today").toLowerCase(); // today | week | month
+    const businessId = Number(req.query.business_id || 0);
+
+    if (!businessId || !Number.isFinite(businessId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing/invalid business_id. Example: /admin/summary?business_id=1&period=today",
+      });
+    }
+
+    // Time window
+    // (Uses server time; fine for MVP. Later we can add timezone per business.)
+    let intervalSql = "1 day";
+    if (period === "week" || period === "7d") intervalSql = "7 days";
+    if (period === "month" || period === "30d") intervalSql = "30 days";
+
+    const sinceSql = `NOW() - INTERVAL '${intervalSql}'`;
+
+    // 1) Sales totals by currency
+    const salesTotals = await pool.query(
+      `
+      SELECT currency, COALESCE(SUM(amount),0) AS total_amount, COALESCE(SUM(quantity),0) AS total_qty
+      FROM sales
+      WHERE business_id = $1 AND created_at >= ${sinceSql}
+      GROUP BY currency
+      ORDER BY total_amount DESC
+      `,
+      [businessId]
+    );
+
+    // 2) Expenses totals by currency
+    const expenseTotals = await pool.query(
+      `
+      SELECT currency, COALESCE(SUM(amount),0) AS total_amount
+      FROM expenses
+      WHERE business_id = $1 AND created_at >= ${sinceSql}
+      GROUP BY currency
+      ORDER BY total_amount DESC
+      `,
+      [businessId]
+    );
+
+    // Build currency maps for net profit calculation
+    const salesMap = {};
+    for (const r of salesTotals.rows) salesMap[r.currency] = Number(r.total_amount);
+
+    const expMap = {};
+    for (const r of expenseTotals.rows) expMap[r.currency] = Number(r.total_amount);
+
+    const currencies = new Set([...Object.keys(salesMap), ...Object.keys(expMap)]);
+    const netByCurrency = {};
+    for (const c of currencies) {
+      netByCurrency[c] = (salesMap[c] || 0) - (expMap[c] || 0);
+    }
+
+    // 3) Top products by revenue
+    const topProductsByRevenue = await pool.query(
+      `
+      SELECT item,
+             currency,
+             COALESCE(SUM(amount),0) AS revenue,
+             COALESCE(SUM(quantity),0) AS qty
+      FROM sales
+      WHERE business_id = $1 AND created_at >= ${sinceSql}
+      GROUP BY item, currency
+      ORDER BY revenue DESC
+      LIMIT 5
+      `,
+      [businessId]
+    );
+
+    // 4) Top products by quantity
+    const topProductsByQty = await pool.query(
+      `
+      SELECT item,
+             COALESCE(SUM(quantity),0) AS qty
+      FROM sales
+      WHERE business_id = $1 AND created_at >= ${sinceSql}
+      GROUP BY item
+      ORDER BY qty DESC
+      LIMIT 5
+      `,
+      [businessId]
+    );
+
+    // 5) Top expense categories
+    const topExpenseCategories = await pool.query(
+      `
+      SELECT category,
+             currency,
+             COALESCE(SUM(amount),0) AS total
+      FROM expenses
+      WHERE business_id = $1 AND created_at >= ${sinceSql}
+      GROUP BY category, currency
+      ORDER BY total DESC
+      LIMIT 5
+      `,
+      [businessId]
+    );
+
+    // 6) Current stock snapshot (latest quantity per item)
+    // We treat stock_events as "set stock to qty" events; latest one wins.
+    const stockSnapshot = await pool.query(
+      `
+      SELECT DISTINCT ON (item)
+        item,
+        quantity,
+        created_at
+      FROM stock_events
+      WHERE business_id = $1
+      ORDER BY item, created_at DESC
+      `,
+      [businessId]
+    );
+
+    // Business info
+    const businessInfo = await pool.query(
+      `SELECT id, business_name, whatsapp_from, default_currency, created_at
+       FROM businesses
+       WHERE id = $1
+       LIMIT 1`,
+      [businessId]
+    );
+
+    return res.json({
+      success: true,
+      period,
+      window: { since: `now - ${intervalSql}` },
+      business: businessInfo.rows[0] || null,
+      totals: {
+        sales_by_currency: salesTotals.rows.map((r) => ({
+          currency: r.currency,
+          total_amount: Number(r.total_amount),
+          total_qty: Number(r.total_qty),
+        })),
+        expenses_by_currency: expenseTotals.rows.map((r) => ({
+          currency: r.currency,
+          total_amount: Number(r.total_amount),
+        })),
+        net_by_currency: netByCurrency,
+      },
+      insights: {
+        top_products_by_revenue: topProductsByRevenue.rows.map((r) => ({
+          item: r.item,
+          currency: r.currency,
+          revenue: Number(r.revenue),
+          qty: Number(r.qty),
+        })),
+        top_products_by_qty: topProductsByQty.rows.map((r) => ({
+          item: r.item,
+          qty: Number(r.qty),
+        })),
+        top_expense_categories: topExpenseCategories.rows.map((r) => ({
+          category: r.category,
+          currency: r.currency,
+          total: Number(r.total),
+        })),
+        stock_snapshot: stockSnapshot.rows.map((r) => ({
+          item: r.item,
+          quantity: Number(r.quantity),
+          last_updated: r.created_at,
+        })),
+      },
+    });
+  } catch (err) {
+    console.error("admin/summary error:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
   console.log(`VERIFY_TOKEN loaded: ${process.env.VERIFY_TOKEN ? "YES" : "NO"}`);
