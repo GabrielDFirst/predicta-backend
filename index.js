@@ -150,6 +150,168 @@ async function insertStockEvent(businessId, item, quantity) {
 }
 
 // ==============================
+// ✅ Step 6A Helpers: Summary engine + WhatsApp formatting
+// ==============================
+
+function periodToInterval(period) {
+  const p = String(period || "today").toLowerCase();
+  if (p === "week" || p === "7d") return "7 days";
+  if (p === "month" || p === "30d") return "30 days";
+  return "1 day"; // today default
+}
+
+function formatMoney(currency, amount) {
+  const n = Number(amount || 0);
+  // Keep it MVP-simple; later we can do locale-aware formatting
+  return `${currency} ${Number.isFinite(n) ? n : 0}`;
+}
+
+async function getBusinessSummary(businessId, period) {
+  const intervalSql = periodToInterval(period);
+  const sinceSql = `NOW() - INTERVAL '${intervalSql}'`;
+
+  const businessInfo = await pool.query(
+    `SELECT id, business_name, whatsapp_from, default_currency
+     FROM businesses
+     WHERE id = $1
+     LIMIT 1`,
+    [businessId]
+  );
+
+  const salesTotals = await pool.query(
+    `
+    SELECT currency, COALESCE(SUM(amount),0) AS total_amount, COALESCE(SUM(quantity),0) AS total_qty
+    FROM sales
+    WHERE business_id = $1 AND created_at >= ${sinceSql}
+    GROUP BY currency
+    ORDER BY total_amount DESC
+    `,
+    [businessId]
+  );
+
+  const expenseTotals = await pool.query(
+    `
+    SELECT currency, COALESCE(SUM(amount),0) AS total_amount
+    FROM expenses
+    WHERE business_id = $1 AND created_at >= ${sinceSql}
+    GROUP BY currency
+    ORDER BY total_amount DESC
+    `,
+    [businessId]
+  );
+
+  const topProductsByRevenue = await pool.query(
+    `
+    SELECT item, currency, COALESCE(SUM(amount),0) AS revenue, COALESCE(SUM(quantity),0) AS qty
+    FROM sales
+    WHERE business_id = $1 AND created_at >= ${sinceSql}
+    GROUP BY item, currency
+    ORDER BY revenue DESC
+    LIMIT 3
+    `,
+    [businessId]
+  );
+
+  const topExpenseCategories = await pool.query(
+    `
+    SELECT category, currency, COALESCE(SUM(amount),0) AS total
+    FROM expenses
+    WHERE business_id = $1 AND created_at >= ${sinceSql}
+    GROUP BY category, currency
+    ORDER BY total DESC
+    LIMIT 3
+    `,
+    [businessId]
+  );
+
+  const stockSnapshot = await pool.query(
+    `
+    SELECT DISTINCT ON (item)
+      item, quantity, created_at
+    FROM stock_events
+    WHERE business_id = $1
+    ORDER BY item, created_at DESC
+    `,
+    [businessId]
+  );
+
+  // Net by currency
+  const salesMap = {};
+  for (const r of salesTotals.rows) salesMap[r.currency] = Number(r.total_amount);
+
+  const expMap = {};
+  for (const r of expenseTotals.rows) expMap[r.currency] = Number(r.total_amount);
+
+  const currencies = new Set([...Object.keys(salesMap), ...Object.keys(expMap)]);
+  const netByCurrency = {};
+  for (const c of currencies) netByCurrency[c] = (salesMap[c] || 0) - (expMap[c] || 0);
+
+  return {
+    intervalSql,
+    business: businessInfo.rows[0] || null,
+    totals: { salesTotals: salesTotals.rows, expenseTotals: expenseTotals.rows, netByCurrency },
+    insights: {
+      topProductsByRevenue: topProductsByRevenue.rows,
+      topExpenseCategories: topExpenseCategories.rows,
+      stockSnapshot: stockSnapshot.rows,
+    },
+  };
+}
+
+function buildWhatsAppSummaryText(summary, period) {
+  const businessName = summary.business?.business_name || "Your Business";
+  const p = String(period || "today").toLowerCase();
+
+  // Totals sections
+  const salesLines =
+    summary.totals.salesTotals.length > 0
+      ? summary.totals.salesTotals.map((r) => `• ${formatMoney(r.currency, r.total_amount)} (qty: ${Number(r.total_qty)})`).join("\n")
+      : "• None";
+
+  const expenseLines =
+    summary.totals.expenseTotals.length > 0
+      ? summary.totals.expenseTotals.map((r) => `• ${formatMoney(r.currency, r.total_amount)}`).join("\n")
+      : "• None";
+
+  const netLines =
+    Object.keys(summary.totals.netByCurrency).length > 0
+      ? Object.entries(summary.totals.netByCurrency).map(([c, v]) => `• ${formatMoney(c, v)}`).join("\n")
+      : "• 0";
+
+  const topSales =
+    summary.insights.topProductsByRevenue.length > 0
+      ? summary.insights.topProductsByRevenue
+          .map((r) => `• ${r.item}: ${formatMoney(r.currency, r.revenue)} (qty: ${Number(r.qty)})`)
+          .join("\n")
+      : "• None";
+
+  const topExpenses =
+    summary.insights.topExpenseCategories.length > 0
+      ? summary.insights.topExpenseCategories
+          .map((r) => `• ${r.category}: ${formatMoney(r.currency, r.total)}`)
+          .join("\n")
+      : "• None";
+
+  const stockPreview =
+    summary.insights.stockSnapshot.length > 0
+      ? summary.insights.stockSnapshot.slice(0, 5).map((r) => `• ${r.item}: ${Number(r.quantity)}`).join("\n")
+      : "• None";
+
+  return (
+    `📊 Predicta Summary (${businessName})\n` +
+    `Period: ${p} (last ${summary.intervalSql})\n\n` +
+    `💰 Sales:\n${salesLines}\n\n` +
+    `💸 Expenses:\n${expenseLines}\n\n` +
+    `📈 Net:\n${netLines}\n\n` +
+    `🏆 Top sales:\n${topSales}\n\n` +
+    `🧾 Top expenses:\n${topExpenses}\n\n` +
+    `📦 Stock (latest):\n${stockPreview}\n\n` +
+    `Tip: send "summary week" or "summary month"`
+  );
+}
+
+
+// ==============================
 // Routes
 // ==============================
 
