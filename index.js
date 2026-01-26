@@ -431,6 +431,16 @@ app.post("/twilio/whatsapp", async (req, res) => {
     } else if (cmd === "help") {
       reply = helpText(businessName);
 
+    } else if (cmd === "summary") {
+      // summary [today|week|month]
+      const period = (parts[1] || "today").toLowerCase();
+
+      const summary = await getBusinessSummary(businessId, period);
+      reply = buildWhatsAppSummaryText(summary, period);
+
+    } else if (cmd === "sale") {
+
+
     } else if (cmd === "sale") {
       const item = parts[1];
       const qtyStr = parts[2];
