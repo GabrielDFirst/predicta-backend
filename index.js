@@ -5,13 +5,16 @@
  * - Incoming webhook receiver (Twilio-style logging + auto-reply): POST /webhook
  * - Twilio WhatsApp Sandbox test sender (TEMP): GET /test-whatsapp
  * - Outbound WhatsApp sender (protected): POST /send-whatsapp
- * - Optional TwiML inbound auto-reply endpoint: POST /twilio/whatsapp
+ * - Twilio WhatsApp inbound (TwiML): POST /twilio/whatsapp
+ * - Admin DB init (protected): POST /admin/init-db
+ * - Admin latest records (protected): GET /admin/latest
+ * - Admin analytics summary (protected): GET /admin/summary?business_id=1&period=today|week|month
  *
  * Required env vars:
  * - TWILIO_ACCOUNT_SID
  * - TWILIO_AUTH_TOKEN
  * - TWILIO_WHATSAPP_FROM   (e.g. whatsapp:+14155238886 for Twilio Sandbox)
- * - PREDICTA_API_KEY       (your own secret for protecting /send-whatsapp)
+ * - PREDICTA_API_KEY       (your own secret for protecting /send-whatsapp + admin endpoints)
  * - DATABASE_URL           (Render Postgres External Database URL)
  *
  * Optional env vars:
@@ -24,14 +27,14 @@ require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
 const twilio = require("twilio");
-const { Pool } = require("pg"); // ✅ Postgres
+const { Pool } = require("pg");
 
 const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
 // ==============================
-// ✅ Postgres connection (Render)
+// Postgres connection (Render)
 // ==============================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -58,7 +61,7 @@ const OWNER_PROFILES = {
 const EVENTS = []; // in-memory (debug only)
 
 // Currency helpers
-const SYMBOL_TO_CODE = { "£": "GBP", "$": "USD", "₦": "NGN" };
+const SYMBOL_TO_CODE = { "£": "GBP", $: "USD", "₦": "NGN" };
 const CODE_SET = new Set(["GBP", "USD", "NGN"]);
 
 function normalizeAmountToken(token) {
@@ -102,18 +105,21 @@ function helpText(businessName) {
     `   e.g. expense fuel ₦15000 | expense ads $30 | expense rent 500 GBP\n` +
     `3) stock <item> <qty>\n` +
     `   e.g. stock rice 20\n` +
-    `4) help`
+    `4) summary [today|week|month]\n` +
+    `   e.g. summary week\n` +
+    `5) advice [today|week|month]\n` +
+    `   e.g. advice month\n` +
+    `6) help`
   );
 }
 
 // ==============================
-// ✅ DB Helpers
+// DB Helpers
 // ==============================
 async function getOrCreateBusinessId(whatsappFrom, businessName, defaultCurrency) {
-  const existing = await pool.query(
-    "SELECT id FROM businesses WHERE whatsapp_from = $1 LIMIT 1",
-    [whatsappFrom]
-  );
+  const existing = await pool.query("SELECT id FROM businesses WHERE whatsapp_from = $1 LIMIT 1", [
+    whatsappFrom,
+  ]);
   if (existing.rows.length) return existing.rows[0].id;
 
   const created = await pool.query(
@@ -150,19 +156,153 @@ async function insertStockEvent(businessId, item, quantity) {
 }
 
 // ==============================
-// ✅ Step 6A Helpers: Summary engine + WhatsApp formatting
+// Step 6B: Smart Insights + Advice (rule-based)
 // ==============================
+function safeNum(n) {
+  const x = Number(n);
+  return Number.isFinite(x) ? x : 0;
+}
 
+function computeInsightsFromSummary(summary) {
+  const tips = [];
+
+  const salesArr = summary?.totals?.sales_by_currency || [];
+  const expArr = summary?.totals?.expenses_by_currency || [];
+  const topProducts = summary?.insights?.top_products_by_revenue || [];
+  const stockSnap = summary?.insights?.stock_snapshot || [];
+
+  // 1) No sales
+  const totalSalesAll = salesArr.reduce((acc, s) => acc + safeNum(s.total_amount), 0);
+  if (totalSalesAll <= 0) {
+    tips.push("📉 No sales recorded in this period. Try logging at least 3 sales to unlock better insights.");
+  }
+
+  // 2) No expenses
+  const totalExpAll = expArr.reduce((acc, e) => acc + safeNum(e.total_amount), 0);
+  if (totalExpAll <= 0) {
+    tips.push("🧾 No expenses recorded. Track costs (fuel, rent, ads) so profit is accurate.");
+  }
+
+  // 3) Revenue concentration risk
+  if (topProducts.length >= 2) {
+    const top1 = safeNum(topProducts[0].revenue);
+    const top2 = safeNum(topProducts[1].revenue);
+    const sumTop = topProducts.reduce((acc, p) => acc + safeNum(p.revenue), 0);
+
+    if (sumTop > 0 && top1 / sumTop >= 0.7) {
+      tips.push(
+        `⚠️ Most revenue comes from "${topProducts[0].item}". Consider adding/marketing 1–2 other products to reduce risk.`
+      );
+    }
+    if (top1 > 0 && top2 === 0) {
+      tips.push(`📌 Only "${topProducts[0].item}" is generating revenue. Confirm other items are logged correctly.`);
+    }
+  } else if (topProducts.length === 1) {
+    tips.push(`📌 Top product is "${topProducts[0].item}". Add more product sales for richer insights.`);
+  }
+
+  // 4) Stock sanity tips
+  if (stockSnap.length > 0) {
+    const s0 = stockSnap[0];
+    const qty = safeNum(s0.quantity);
+    if (qty === 0) tips.push(`🚨 Stockout risk: "${s0.item}" stock is 0. Restock soon.`);
+    if (qty > 0 && qty >= 200) tips.push(`📦 High stock: "${s0.item}" is ${qty}. Consider a promo to increase turnover.`);
+  } else {
+    tips.push('📦 No stock updates found. Use: stock <item> <qty> (e.g. "stock rice 20").');
+  }
+
+  // 5) Net negative check (per currency)
+  const netBy = summary?.totals?.net_by_currency || {};
+  for (const [cur, net] of Object.entries(netBy)) {
+    if (safeNum(net) < 0) tips.push(`🔻 Net is negative in ${cur}. Review expenses and pricing.`);
+  }
+
+  return tips.slice(0, 6);
+}
+
+function formatAdviceMessage(summary) {
+  const businessName = summary?.business?.business_name || "Your Business";
+  const period = summary?.period || "period";
+  const tips = computeInsightsFromSummary(summary);
+
+  const topProducts = summary?.insights?.top_products_by_revenue || [];
+  const topLine =
+    topProducts.length > 0
+      ? `🏆 Top product: ${topProducts[0].item} (${topProducts[0].currency} ${safeNum(topProducts[0].revenue)})`
+      : "🏆 Top product: None yet";
+
+  const lines = [
+    `🧠 Predicta Advice (${businessName})`,
+    `Period: ${period}`,
+    "",
+    topLine,
+    "",
+    "✅ Actionable tips:",
+    ...tips.map((t) => `• ${t}`),
+    "",
+    `Tip: try "summary week" to see numbers.`,
+  ];
+
+  return lines.join("\n");
+}
+
+function appendInsightsToSummaryText(summaryText, summaryObj) {
+  const tips = computeInsightsFromSummary(summaryObj);
+  if (!tips.length) return summaryText;
+
+  return `${summaryText}\n\n🧠 Insights:\n${tips.map((t) => `• ${t}`).join("\n")}`;
+}
+
+// Adapter: internal getBusinessSummary() -> admin-like shape for insights/advice
+function adaptInternalSummaryToAdminShape(internalSummary, period) {
+  return {
+    period: String(period || "today").toLowerCase(),
+    business: internalSummary.business,
+    totals: {
+      sales_by_currency: (internalSummary.totals.salesTotals || []).map((r) => ({
+        currency: r.currency,
+        total_amount: Number(r.total_amount),
+        total_qty: Number(r.total_qty),
+      })),
+      expenses_by_currency: (internalSummary.totals.expenseTotals || []).map((r) => ({
+        currency: r.currency,
+        total_amount: Number(r.total_amount),
+      })),
+      net_by_currency: internalSummary.totals.netByCurrency || {},
+    },
+    insights: {
+      top_products_by_revenue: (internalSummary.insights.topProductsByRevenue || []).map((r) => ({
+        item: r.item,
+        currency: r.currency,
+        revenue: Number(r.revenue),
+        qty: Number(r.qty),
+      })),
+      top_expense_categories: (internalSummary.insights.topExpenseCategories || []).map((r) => ({
+        category: r.category,
+        currency: r.currency,
+        total: Number(r.total),
+      })),
+      stock_snapshot: (internalSummary.insights.stockSnapshot || []).map((r) => ({
+        item: r.item,
+        quantity: Number(r.quantity),
+        last_updated: r.created_at,
+      })),
+    },
+  };
+}
+
+// ==============================
+// Step 6A: Summary engine + WhatsApp formatting
+// ==============================
 function periodToInterval(period) {
   const p = String(period || "today").toLowerCase();
   if (p === "week" || p === "7d") return "7 days";
   if (p === "month" || p === "30d") return "30 days";
-  return "1 day"; // today default
+  return "1 day";
 }
 
 function formatMoney(currency, amount) {
   const n = Number(amount || 0);
-  // Keep it MVP-simple; later we can do locale-aware formatting
   return `${currency} ${Number.isFinite(n) ? n : 0}`;
 }
 
@@ -262,10 +402,11 @@ function buildWhatsAppSummaryText(summary, period) {
   const businessName = summary.business?.business_name || "Your Business";
   const p = String(period || "today").toLowerCase();
 
-  // Totals sections
   const salesLines =
     summary.totals.salesTotals.length > 0
-      ? summary.totals.salesTotals.map((r) => `• ${formatMoney(r.currency, r.total_amount)} (qty: ${Number(r.total_qty)})`).join("\n")
+      ? summary.totals.salesTotals
+          .map((r) => `• ${formatMoney(r.currency, r.total_amount)} (qty: ${Number(r.total_qty)})`)
+          .join("\n")
       : "• None";
 
   const expenseLines =
@@ -275,7 +416,9 @@ function buildWhatsAppSummaryText(summary, period) {
 
   const netLines =
     Object.keys(summary.totals.netByCurrency).length > 0
-      ? Object.entries(summary.totals.netByCurrency).map(([c, v]) => `• ${formatMoney(c, v)}`).join("\n")
+      ? Object.entries(summary.totals.netByCurrency)
+          .map(([c, v]) => `• ${formatMoney(c, v)}`)
+          .join("\n")
       : "• 0";
 
   const topSales =
@@ -306,10 +449,20 @@ function buildWhatsAppSummaryText(summary, period) {
     `🏆 Top sales:\n${topSales}\n\n` +
     `🧾 Top expenses:\n${topExpenses}\n\n` +
     `📦 Stock (latest):\n${stockPreview}\n\n` +
-    `Tip: send "summary week" or "summary month"`
+    `Tip: send "summary week" or "summary month" or "advice week"`
   );
 }
 
+// ==============================
+// Middleware: API key guard (for admin + outbound)
+// ==============================
+function requireApiKey(req, res, next) {
+  const apiKey = req.header("x-api-key");
+  if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+  return next();
+}
 
 // ==============================
 // Routes
@@ -377,12 +530,7 @@ app.get("/test-whatsapp", async (req, res) => {
 });
 
 // Outbound protected
-app.post("/send-whatsapp", async (req, res) => {
-  const apiKey = req.header("x-api-key");
-  if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
-    return res.status(401).json({ success: false, error: "Unauthorized" });
-  }
-
+app.post("/send-whatsapp", requireApiKey, async (req, res) => {
   try {
     const { to, body } = req.body || {};
     const finalTo = to || process.env.DEFAULT_WHATSAPP_TO;
@@ -409,7 +557,7 @@ app.post("/send-whatsapp", async (req, res) => {
   }
 });
 
-// ✅ INBOUND: Twilio WhatsApp webhook (Event Engine + DB persistence)
+// Inbound: Twilio WhatsApp webhook (Event Engine + DB persistence)
 app.post("/twilio/whatsapp", async (req, res) => {
   try {
     const from = req.body.From; // "whatsapp:+..."
@@ -432,14 +580,19 @@ app.post("/twilio/whatsapp", async (req, res) => {
       reply = helpText(businessName);
 
     } else if (cmd === "summary") {
-      // summary [today|week|month]
       const period = (parts[1] || "today").toLowerCase();
+      const internalSummary = await getBusinessSummary(businessId, period);
+      const summaryText = buildWhatsAppSummaryText(internalSummary, period);
 
-      const summary = await getBusinessSummary(businessId, period);
-      reply = buildWhatsAppSummaryText(summary, period);
+      const adminShapeSummary = adaptInternalSummaryToAdminShape(internalSummary, period);
+      reply = appendInsightsToSummaryText(summaryText, adminShapeSummary);
 
-    } else if (cmd === "sale") {
+    } else if (cmd === "advice") {
+      const period = (parts[1] || "today").toLowerCase();
+      const internalSummary = await getBusinessSummary(businessId, period);
 
+      const adminShapeSummary = adaptInternalSummaryToAdminShape(internalSummary, period);
+      reply = formatAdviceMessage(adminShapeSummary);
 
     } else if (cmd === "sale") {
       const item = parts[1];
@@ -469,7 +622,6 @@ app.post("/twilio/whatsapp", async (req, res) => {
           };
           EVENTS.push(event);
 
-          // ✅ 5B.4: Persist sale
           await insertSale(businessId, event.item, event.quantity, event.amount, event.currency);
 
           reply =
@@ -504,7 +656,6 @@ app.post("/twilio/whatsapp", async (req, res) => {
           };
           EVENTS.push(event);
 
-          // ✅ 5B.4: Persist expense
           await insertExpense(businessId, event.category, event.amount, event.currency);
 
           reply =
@@ -534,7 +685,6 @@ app.post("/twilio/whatsapp", async (req, res) => {
         };
         EVENTS.push(event);
 
-        // ✅ 5B.4: Persist stock event
         await insertStockEvent(businessId, event.item, event.quantity);
 
         reply =
@@ -544,10 +694,7 @@ app.post("/twilio/whatsapp", async (req, res) => {
       }
 
     } else {
-      reply =
-        `I didn’t understand that.\n` +
-        `Type "help" to see commands.\n\n` +
-        `Example: sale rice 3 ₦45000`;
+      reply = `I didn’t understand that.\nType "help" to see commands.\n\nExample: sale rice 3 ₦45000`;
     }
 
     const twiml = new twilio.twiml.MessagingResponse();
@@ -559,13 +706,8 @@ app.post("/twilio/whatsapp", async (req, res) => {
   }
 });
 
-// DB init endpoint (protected)
-app.post("/admin/init-db", async (req, res) => {
-  const apiKey = req.header("x-api-key");
-  if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
-    return res.status(401).json({ success: false, error: "Unauthorized" });
-  }
-
+// Admin: init DB (protected)
+app.post("/admin/init-db", requireApiKey, async (req, res) => {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS businesses (
@@ -617,15 +759,8 @@ app.post("/admin/init-db", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-
-// ✅ Admin: quick DB proof (latest records)
-app.get("/admin/latest", async (req, res) => {
-  const apiKey = req.header("x-api-key");
-  if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
-    return res.status(401).json({ success: false, error: "Unauthorized" });
-  }
-
+// Admin: latest (protected)
+app.get("/admin/latest", requireApiKey, async (req, res) => {
   try {
     const businesses = await pool.query(
       "SELECT id, business_name, whatsapp_from, default_currency, created_at FROM businesses ORDER BY id DESC LIMIT 5"
@@ -665,16 +800,9 @@ app.get("/admin/latest", async (req, res) => {
   }
 });
 
-
-// ✅ Admin: analytics summary (by business_id + period)
-app.get("/admin/summary", async (req, res) => {
-  const apiKey = req.header("x-api-key");
-  if (!process.env.PREDICTA_API_KEY || apiKey !== process.env.PREDICTA_API_KEY) {
-    return res.status(401).json({ success: false, error: "Unauthorized" });
-  }
-
+// Admin: analytics summary (protected)
+app.get("/admin/summary", requireApiKey, async (req, res) => {
   try {
-    // Inputs
     const period = String(req.query.period || "today").toLowerCase(); // today | week | month
     const businessId = Number(req.query.business_id || 0);
 
@@ -685,15 +813,12 @@ app.get("/admin/summary", async (req, res) => {
       });
     }
 
-    // Time window
-    // (Uses server time; fine for MVP. Later we can add timezone per business.)
     let intervalSql = "1 day";
     if (period === "week" || period === "7d") intervalSql = "7 days";
     if (period === "month" || period === "30d") intervalSql = "30 days";
 
     const sinceSql = `NOW() - INTERVAL '${intervalSql}'`;
 
-    // 1) Sales totals by currency
     const salesTotals = await pool.query(
       `
       SELECT currency, COALESCE(SUM(amount),0) AS total_amount, COALESCE(SUM(quantity),0) AS total_qty
@@ -705,7 +830,6 @@ app.get("/admin/summary", async (req, res) => {
       [businessId]
     );
 
-    // 2) Expenses totals by currency
     const expenseTotals = await pool.query(
       `
       SELECT currency, COALESCE(SUM(amount),0) AS total_amount
@@ -717,7 +841,6 @@ app.get("/admin/summary", async (req, res) => {
       [businessId]
     );
 
-    // Build currency maps for net profit calculation
     const salesMap = {};
     for (const r of salesTotals.rows) salesMap[r.currency] = Number(r.total_amount);
 
@@ -726,17 +849,11 @@ app.get("/admin/summary", async (req, res) => {
 
     const currencies = new Set([...Object.keys(salesMap), ...Object.keys(expMap)]);
     const netByCurrency = {};
-    for (const c of currencies) {
-      netByCurrency[c] = (salesMap[c] || 0) - (expMap[c] || 0);
-    }
+    for (const c of currencies) netByCurrency[c] = (salesMap[c] || 0) - (expMap[c] || 0);
 
-    // 3) Top products by revenue
     const topProductsByRevenue = await pool.query(
       `
-      SELECT item,
-             currency,
-             COALESCE(SUM(amount),0) AS revenue,
-             COALESCE(SUM(quantity),0) AS qty
+      SELECT item, currency, COALESCE(SUM(amount),0) AS revenue, COALESCE(SUM(quantity),0) AS qty
       FROM sales
       WHERE business_id = $1 AND created_at >= ${sinceSql}
       GROUP BY item, currency
@@ -746,11 +863,9 @@ app.get("/admin/summary", async (req, res) => {
       [businessId]
     );
 
-    // 4) Top products by quantity
     const topProductsByQty = await pool.query(
       `
-      SELECT item,
-             COALESCE(SUM(quantity),0) AS qty
+      SELECT item, COALESCE(SUM(quantity),0) AS qty
       FROM sales
       WHERE business_id = $1 AND created_at >= ${sinceSql}
       GROUP BY item
@@ -760,12 +875,9 @@ app.get("/admin/summary", async (req, res) => {
       [businessId]
     );
 
-    // 5) Top expense categories
     const topExpenseCategories = await pool.query(
       `
-      SELECT category,
-             currency,
-             COALESCE(SUM(amount),0) AS total
+      SELECT category, currency, COALESCE(SUM(amount),0) AS total
       FROM expenses
       WHERE business_id = $1 AND created_at >= ${sinceSql}
       GROUP BY category, currency
@@ -775,14 +887,10 @@ app.get("/admin/summary", async (req, res) => {
       [businessId]
     );
 
-    // 6) Current stock snapshot (latest quantity per item)
-    // We treat stock_events as "set stock to qty" events; latest one wins.
     const stockSnapshot = await pool.query(
       `
       SELECT DISTINCT ON (item)
-        item,
-        quantity,
-        created_at
+        item, quantity, created_at
       FROM stock_events
       WHERE business_id = $1
       ORDER BY item, created_at DESC
@@ -790,7 +898,6 @@ app.get("/admin/summary", async (req, res) => {
       [businessId]
     );
 
-    // Business info
     const businessInfo = await pool.query(
       `SELECT id, business_name, whatsapp_from, default_currency, created_at
        FROM businesses
@@ -845,6 +952,7 @@ app.get("/admin/summary", async (req, res) => {
   }
 });
 
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`Predicta running on port ${PORT}`);
